@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using TaskManager.Api.Data;
 using TaskManager.Api.Models;
+using TaskManager.Api.Domain;
 
 namespace TaskManager.Api.Services;
 
@@ -16,83 +17,95 @@ public sealed class SubscriptionService
         _db = db;
     }
 
-    public static class PlanLimits
-    {
-        private static readonly IReadOnlyDictionary<CompanyPlan, int?> MaxProjects =
-            new Dictionary<CompanyPlan, int?>
-            {
-                [CompanyPlan.Freemium] = 1,
-                [CompanyPlan.Basic] = 10,
-                [CompanyPlan.Advanced] = null
-            };
-
-        public static int? GetMaxProjects(CompanyPlan plan) =>
-            MaxProjects.TryGetValue(plan, out var limit)
-                ? limit
-                : throw new ArgumentOutOfRangeException(nameof(plan), plan, "Unknown plan.");
-    }
-
     public async Task<(Project? Project, string? Error, int StatusCode)> CreateProjectAsync(
         Guid companyId, string name, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
-            throw;
+            return (null, "Company name is required.", StatusCodes.Status400BadRequest);
         }
 
-        var company = await _db.Companies
+        var companyPlan = await _db.Companies
             .AsNoTracking()
             .Where(c => c.Id == companyId)
-            .Select(c => new { c.Id, c.SubscriptionPlan })
+            .Select(c => (SubscriptionPlan?)c.SubscriptionPlan)
             .FirstOrDefaultAsync(cancellationToken);
 
-        if (company is null)
+        if (companyPlan is null)
         {
-            throw;
+            return (null, $"Company '{companyId}' was not found.", StatusCodes.Status404NotFound);
         }
 
-        var maxProjects = PlanLimits.GetMaxProjects(company.SubscriptionPlan);
-        
-        var currentCount = await _db.Projects
-            .CountAsync(p => p.CompanyId == companyId, cancellationToken);
+        var maxProjects = companyPlan.Value.GetMaxProjects();
 
-        if (currentCount >= maxProjects.Value)
-            return (null, $"Project limit reached for plan '{company.Plan}' ({maxProjects.Value}).", StatusCodes.Status409Conflict);
-
-        await SaveProjectAsync();
-        
-        
-        // TODO: Load the company, return 404 when missing, count its projects,
-        // enforce Freemium=1, Basic=10, Advanced=unlimited, then persist the project.
-        await Task.CompletedTask;
-        return (null, "Project creation is not implemented yet.", StatusCodes.Status501NotImplemented);
-    }
-
-    public async Task<int>? SaveProjectAsync()
-    {
-        var project = new Project
+        if(maxProjects is not null)
         {
-            Id = Guid.NewGuid(),
+            var currentCount = await _db.Projects
+                .CountAsync(p => p.CompanyId == companyId, cancellationToken);
+
+            if (currentCount >= maxProjects)
+                return (null, $"Project limit reached for plan '{companyPlan}'.", StatusCodes.Status409Conflict);   
+        }
+
+        var project = await SaveAsync(new Project
+        {
             CompanyId = companyId,
-            Name = trimmedName,
-            CreatedAt = DateTime.UtcNow
-        };
+            Name = name.Trim()
+        }, 
+        cancellationToken);
 
-        _db.Projects.Add(project);
-
-        await _dbContext.SaveChangesAsync(cancellationToken);
-        await transaction.CommitAsync(cancellationToken);  
-    } 
+        return (project, null, StatusCodes.Status201Created);
+        
+    }
 
     public async Task<(TaskItem? Task, string? Error, int StatusCode)> CreateTaskAsync(
         Guid projectId, string title, CancellationToken cancellationToken = default)
     {
-        // TODO: Load project and company/plan, return 404 when missing,
-        // enforce Freemium=20 tasks per project; Basic and Advanced are unlimited,
-        // then persist the task.
-        await Task.CompletedTask;
-        return (null, "Task creation is not implemented yet.", StatusCodes.Status501NotImplemented);
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return (null, "Task name is required.", StatusCodes.Status400BadRequest);
+        }
+
+        var projectPlan = await _db.Projects
+            .AsNoTracking()
+            .Where(p => p.Id == projectId)
+            .Select(p => p.Company!.SubscriptionPlan)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (projectPlan is null)
+        {
+            return (null, $"Project '{projectId}' was not found.", StatusCodes.Status404NotFound);
+        }
+
+        var maxTasks = projectPlan.Value.GetMaxTasksPerProject();
+
+        if(maxTasks is not null)
+        {
+            var currentCount = await _db.TaskItem
+            .CountAsync(t => t.ProjectId == projectId, cancellationToken);
+
+            if (currentCount >= maxTasks)
+                return (null, $"Task limit of {maxTasks.Value} reached for plan '{projectPlan}'.", StatusCodes.Status409Conflict);   
+        }
+
+        var task = await SaveAsync(new TaskItem
+        {
+            ProjectId = projectId,
+            Title = title.Trim()
+        }, 
+        cancellationToken);
+
+        return (task, null, StatusCodes.Status201Created);
     }
+
+    private async Task<T> SaveAsync<T>(T entity, CancellationToken cancellationToken)
+        where T : class
+    {
+        _db.Add(entity);
+        await _db.SaveChangesAsync(cancellationToken);
+        return entity;
+    }
+
 
     // Add private helpers or domain exceptions if they improve clarity.
 }
